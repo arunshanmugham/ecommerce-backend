@@ -1,0 +1,86 @@
+### REST requests for IntelliJ HTTP Client / VS Code REST Client.
+@base = http://localhost:8080
+
+### List products (seeded on first start)
+GET {{base}}/api/products
+
+### 1. Happy path: payment -> inventory -> shipping -> notification -> COMPLETED
+POST {{base}}/api/orders
+Content-Type: application/json
+
+{
+  "customerName": "Jane Doe",
+  "customerEmail": "jane@example.com",
+  "shippingAddress": "221B Baker Street, London",
+  "paymentToken": "tok_visa",
+  "items": [
+    { "sku": "LAPTOP-001", "quantity": 1 },
+    { "sku": "MOUSE-001", "quantity": 2 }
+  ]
+}
+
+### 2. Transient gateway errors: Temporal retries payment, order still COMPLETES
+POST {{base}}/api/orders
+Content-Type: application/json
+
+{
+  "customerName": "Flaky Fred",
+  "customerEmail": "fred@example.com",
+  "shippingAddress": "1 Main St",
+  "paymentToken": "tok_flaky",
+  "items": [ { "sku": "PHONE-001", "quantity": 1 } ]
+}
+
+### 3. Card declined: FAILED, nothing reserved or shipped
+POST {{base}}/api/orders
+Content-Type: application/json
+
+{
+  "customerName": "Declined Dan",
+  "customerEmail": "dan@example.com",
+  "shippingAddress": "1 Main St",
+  "paymentToken": "tok_declined",
+  "items": [ { "sku": "PHONE-001", "quantity": 1 } ]
+}
+
+### 4. Out of stock (MONITOR-001 has only 2): payment REFUNDED, order FAILED
+POST {{base}}/api/orders
+Content-Type: application/json
+
+{
+  "customerName": "Greedy Greg",
+  "customerEmail": "greg@example.com",
+  "shippingAddress": "1 Main St",
+  "paymentToken": "tok_visa",
+  "items": [ { "sku": "MONITOR-001", "quantity": 5 } ]
+}
+
+### 5. Undeliverable address: inventory RELEASED + payment REFUNDED, order FAILED
+POST {{base}}/api/orders
+Content-Type: application/json
+
+{
+  "customerName": "Lost Larry",
+  "customerEmail": "larry@example.com",
+  "shippingAddress": "UNDELIVERABLE island",
+  "paymentToken": "tok_visa",
+  "items": [ { "sku": "HEADPHONES-001", "quantity": 1 } ]
+}
+
+### List orders
+GET {{base}}/api/orders
+
+### Order from MySQL (replace the order number)
+GET {{base}}/api/orders/ORD-XXXXXXXX
+
+### Live workflow status + progress query from Temporal
+GET {{base}}/api/orders/ORD-XXXXXXXX/workflow
+
+### Everything each service recorded (payment, reservations, shipment, notifications)
+GET {{base}}/api/orders/ORD-XXXXXXXX/audit
+
+### Create or update a product / restock
+PUT {{base}}/api/products
+Content-Type: application/json
+
+{ "sku": "MONITOR-001", "name": "27\" 4K monitor", "price": 349.00, "availableQuantity": 20 }
