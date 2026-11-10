@@ -1,0 +1,32 @@
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: ecommerce-backend
+  datasource:
+    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:ecommerce}?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:root}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      hibernate.format_sql: true
+
+temporal:
+  target: ${TEMPORAL_TARGET:localhost:7233}
+  namespace: ${TEMPORAL_NAMESPACE:default}
+  # Which workers this process hosts. Run everything in one JVM (default) or split
+  # services across processes, e.g. WORKERS=payment on one JVM, WORKERS=order,inventory on another.
+  workers: ${WORKERS:order,payment,inventory,shipping,notification}
+
+app:
+  seed-products: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
