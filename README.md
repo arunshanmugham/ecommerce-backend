@@ -219,6 +219,8 @@ queue as the workflow. Here each service has its own queue, so it does not apply
 - Stop the Temporal server while an order is running: the order freezes at its current step and continues
   when the server comes back.
 
+**Video walkthrough:** [▶ Watch the activity stub flow (MP4, 5 MB)](docs/media/activity-stub-flow.mp4)
+
 ### Order flow
 
 ```mermaid
