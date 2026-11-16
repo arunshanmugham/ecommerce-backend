@@ -88,6 +88,100 @@ Temporal stores the request durably, and whichever worker polls that queue runs 
 the services independently deployable, and why an order survives a crash or restart of any process: on
 restart, the workflow is replayed from its event history and continues from the last completed step.
 
+### How the workflow calls a service: activity stubs
+
+`OrderWorkflowImpl` creates one **activity stub** per service:
+
+```java
+private final PaymentActivities payment =
+        Workflow.newActivityStub(PaymentActivities.class, optionsFor(TaskQueues.PAYMENT));
+```
+
+"Stub" is the classic RPC term for a local object that looks like the real service but contains no
+business logic. `newActivityStub` returns a dynamic proxy implementing `PaymentActivities`; calling
+`payment.processPayment(...)` does not charge anything. It turns the call into a request to the Temporal
+server, and the real `PaymentActivitiesImpl` runs wherever a payment worker is polling.
+
+**The stub never calls the worker directly, even in the same JVM.** With the default `WORKERS` setting,
+all five workers run in the same Spring Boot process as the workflow. Each worker has poller threads
+that hold long-poll gRPC requests open to the Temporal server for their own task queue:
+
+```
+                       Spring Boot JVM
+ ┌───────────────────────────────────────────────────────────────┐
+ │ Workflow thread: OrderWorkflowImpl                            │
+ │   payment.processPayment(...)  (stub)                         │
+ │                                                               │
+ │ Order worker poller         → PollWorkflowTaskQueue(ORDER)    │
+ │ Payment worker poller       → PollActivityTaskQueue(PAYMENT)  │
+ │ Inventory worker poller     → PollActivityTaskQueue(INVENTORY)│
+ │ ...                                                           │
+ └──────────────────────────┬────────────────────────────────────┘
+                            │ gRPC over TCP (localhost:7233)
+                            ▼
+                Temporal server: event history + task queues
+```
+
+One stub call takes several round trips through the server:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant WF as OrderWorkflowImpl<br/>(order worker)
+    participant T as Temporal server
+    participant PW as Payment worker<br/>(PaymentActivitiesImpl)
+
+    WF->>WF: payment.processPayment(...)<br/>stub records ScheduleActivityTask, workflow pauses
+    WF->>T: RespondWorkflowTaskCompleted (gRPC)
+    T->>T: write ActivityTaskScheduled, queue task on PAYMENT_TASK_QUEUE
+    PW->>T: PollActivityTaskQueue (long poll, already waiting)
+    T-->>PW: activity task (JSON arguments)
+    PW->>PW: PaymentActivitiesImpl.processPayment(...)
+    PW->>T: RespondActivityTaskCompleted("TXN-…")
+    T->>T: write ActivityTaskCompleted, queue workflow task on ORDER_TASK_QUEUE
+    WF->>T: PollWorkflowTaskQueue
+    T-->>WF: workflow task (history incl. result)
+    WF->>WF: replay: stub call returns "TXN-…"
+```
+
+1. The stub serializes the call (activity type, JSON arguments, task queue, timeout, retry policy into a
+   `ScheduleActivityTask` command) and blocks the workflow thread.
+2. The SDK sends the command to the server with `RespondWorkflowTaskCompleted`.
+3. The server writes `ActivityTaskScheduled` to the event history and queues a task on `PAYMENT_TASK_QUEUE`.
+4. The payment worker's waiting `PollActivityTaskQueue` request receives the task.
+5. The worker deserializes the arguments, calls `PaymentActivitiesImpl.processPayment(...)` on an activity
+   thread, and reports the result with `RespondActivityTaskCompleted`. On failure or timeout, the server
+   retries according to the retry policy; the workflow only sees an `ActivityFailure` once retries run out.
+6. The server writes `ActivityTaskCompleted` and queues a workflow task. The order worker picks it up,
+   replays the workflow from history, and the stub call returns the recorded result.
+
+**Why there is no in-process shortcut.** A direct method call would not be recorded on the server. Going
+through it every time is what gives retries, timeouts and crash recovery, and it makes **replay** safe:
+if the order worker crashes after payment succeeded, the replayed workflow reaches `processPayment` again,
+finds the result already in the history, and returns it without charging the customer a second time.
+It is also why splitting services into separate processes (`WORKERS=payment` etc.) needs no code
+changes: only the location of the poller changes.
+
+**Related APIs**
+
+| API | Difference |
+|-----|------------|
+| `Workflow.newActivityStub` *(used here)* | Typed, compile-checked; carries `ActivityOptions` (task queue, timeouts, retries). |
+| `Workflow.newUntypedActivityStub` | Same execution path, but activities are called by string name; useful for activities written in another language. |
+| `Workflow.newLocalActivityStub` | Runs in the workflow's own worker without a task queue; only the result is recorded. Cannot route to another service's task queue, so not suitable here. |
+| `Workflow.executeActivity` | `@Experimental` (SDK 1.40). Invokes a stub method reference with `ActivityInvocationOptions`, which currently only sets a custom activity ID. Still needs a stub for task queue, timeouts and retries. |
+
+Temporal's *eager activity execution* can skip the queue wait when the activity is on the **same** task
+queue as the workflow. Here each service has its own queue, so it does not apply.
+
+**See it yourself**
+
+- Temporal UI (http://localhost:8233): open an `order-ORD-…` workflow; each step shows
+  `ActivityTaskScheduled` → `ActivityTaskStarted` (with the worker identity) → `ActivityTaskCompleted`.
+- Connections from the app to the server (PowerShell): `Get-NetTCPConnection -RemotePort 7233 -State Established`
+- Stop the Temporal server while an order is running: the order freezes at its current step and continues
+  when the server comes back.
+
 ### Order flow
 
 ```mermaid
