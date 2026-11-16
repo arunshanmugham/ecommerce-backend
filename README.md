@@ -107,53 +107,90 @@ all five workers run in the same Spring Boot process as the workflow. Each worke
 that hold long-poll gRPC requests open to the Temporal server for their own task queue:
 
 ```
-                       Spring Boot JVM
- ┌───────────────────────────────────────────────────────────────┐
- │ Workflow thread: OrderWorkflowImpl                            │
- │   payment.processPayment(...)  (stub)                         │
- │                                                               │
- │ Order worker poller         → PollWorkflowTaskQueue(ORDER)    │
- │ Payment worker poller       → PollActivityTaskQueue(PAYMENT)  │
- │ Inventory worker poller     → PollActivityTaskQueue(INVENTORY)│
- │ ...                                                           │
- └──────────────────────────┬────────────────────────────────────┘
-                            │ gRPC over TCP (localhost:7233)
-                            ▼
-                Temporal server: event history + task queues
+                               Spring Boot JVM
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │  CALLER SIDE (order worker)            │  CALLEE SIDE (payment worker)   │
+ │                                        │                                 │
+ │  OrderWorkflowImpl                     │  PaymentActivitiesImpl          │
+ │    │ payment.processPayment(...)       │    ▲ processPayment(...)        │
+ │    ▼                                   │    │ (real code: DB write)      │
+ │  PaymentActivities STUB                │    │                            │
+ │  (dynamic proxy, no business logic)    │  Payment worker (SDK)           │
+ │    │ ScheduleActivityTask command      │    ▲ activity task              │
+ │    ▼                                   │    │                            │
+ │  Order worker (SDK)                    │  Poller thread                  │
+ │    │ PollWorkflowTaskQueue(ORDER)      │    │ PollActivityTaskQueue      │
+ │    │                                   │    │ (PAYMENT)                  │
+ └────┼───────────────────────────────────┴────┼────────────────────────────┘
+      │      no direct Java call between        │
+      │      the stub and the implementation    │
+      ▼        gRPC (localhost:7233)            │
+ ┌──────────────────────────────────────────────┴──┐
+ │ Temporal server: event history + task queues    │
+ └─────────────────────────────────────────────────┘
 ```
 
-One stub call takes several round trips through the server:
+One stub call takes several round trips through the server. The stub (left) and the implementation
+(right) never talk to each other directly:
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant WF as OrderWorkflowImpl<br/>(order worker)
+    box Order worker - caller side
+        participant WF as OrderWorkflowImpl<br/>(workflow code)
+        participant Stub as PaymentActivities<br/>STUB (proxy)
+        participant OW as Order worker<br/>(Temporal SDK)
+    end
     participant T as Temporal server
-    participant PW as Payment worker<br/>(PaymentActivitiesImpl)
+    box Payment worker - callee side
+        participant PW as Payment worker<br/>(Temporal SDK poller)
+        participant Impl as PaymentActivitiesImpl<br/>(real implementation)
+    end
 
-    WF->>WF: payment.processPayment(...)<br/>stub records ScheduleActivityTask, workflow pauses
-    WF->>T: RespondWorkflowTaskCompleted (gRPC)
-    T->>T: write ActivityTaskScheduled, queue task on PAYMENT_TASK_QUEUE
+    WF->>Stub: payment.processPayment(orderNumber, amount, token)
+    Stub->>Stub: serialize args to JSON,<br/>build ScheduleActivityTask command
+    Stub->>OW: hand over command (workflow thread blocks)
+    OW->>T: RespondWorkflowTaskCompleted [ScheduleActivityTask]
+    T->>T: write ActivityTaskScheduled,<br/>queue task on PAYMENT_TASK_QUEUE
     PW->>T: PollActivityTaskQueue (long poll, already waiting)
-    T-->>PW: activity task (JSON arguments)
-    PW->>PW: PaymentActivitiesImpl.processPayment(...)
+    T-->>PW: activity task (type + JSON args)
+    PW->>Impl: processPayment(orderNumber, amount, token)
+    Impl->>Impl: PaymentService.charge() → MySQL
+    Impl-->>PW: "TXN-…"
     PW->>T: RespondActivityTaskCompleted("TXN-…")
-    T->>T: write ActivityTaskCompleted, queue workflow task on ORDER_TASK_QUEUE
-    WF->>T: PollWorkflowTaskQueue
-    T-->>WF: workflow task (history incl. result)
-    WF->>WF: replay: stub call returns "TXN-…"
+    T->>T: write ActivityTaskCompleted,<br/>queue workflow task on ORDER_TASK_QUEUE
+    OW->>T: PollWorkflowTaskQueue
+    T-->>OW: workflow task (history incl. result)
+    OW->>WF: replay processOrder from history
+    WF->>Stub: payment.processPayment(...) again
+    Stub->>Stub: result already in history,<br/>nothing scheduled
+    Stub-->>WF: return "TXN-…"
 ```
 
-1. The stub serializes the call (activity type, JSON arguments, task queue, timeout, retry policy into a
-   `ScheduleActivityTask` command) and blocks the workflow thread.
-2. The SDK sends the command to the server with `RespondWorkflowTaskCompleted`.
-3. The server writes `ActivityTaskScheduled` to the event history and queues a task on `PAYMENT_TASK_QUEUE`.
-4. The payment worker's waiting `PollActivityTaskQueue` request receives the task.
-5. The worker deserializes the arguments, calls `PaymentActivitiesImpl.processPayment(...)` on an activity
-   thread, and reports the result with `RespondActivityTaskCompleted`. On failure or timeout, the server
-   retries according to the retry policy; the workflow only sees an `ActivityFailure` once retries run out.
-6. The server writes `ActivityTaskCompleted` and queues a workflow task. The order worker picks it up,
-   replays the workflow from history, and the stub call returns the recorded result.
+Steps 1–4 happen on the caller side, 6–11 on the callee side, and 12–18 back on the caller side:
+
+1. **Workflow → stub.** `OrderWorkflowImpl` calls `payment.processPayment(...)`. `payment` is the stub,
+   not `PaymentActivitiesImpl`.
+2. **Stub builds a command.** It serializes the arguments to JSON and creates a `ScheduleActivityTask`
+   command with the activity type, task queue, timeouts and retry policy from `ActivityOptions`.
+3. **Stub → order worker.** The command goes to the SDK and the workflow thread blocks.
+4. **Order worker → server.** The SDK sends the command with `RespondWorkflowTaskCompleted`.
+5. **Server.** Writes `ActivityTaskScheduled` to the event history and queues a task on `PAYMENT_TASK_QUEUE`.
+6. **Payment worker polls.** Its waiting `PollActivityTaskQueue` request…
+7. …receives the task.
+8. **Payment worker → implementation.** The SDK deserializes the arguments and calls the real
+   `PaymentActivitiesImpl.processPayment(...)` on an activity thread.
+9. **Implementation does the work:** `PaymentService.charge()` writes the payment to MySQL.
+10. It returns the transaction ID to the worker…
+11. …which reports it with `RespondActivityTaskCompleted`. On failure or timeout, the server retries
+    according to the retry policy; the workflow only sees an `ActivityFailure` once retries run out.
+12. **Server.** Writes `ActivityTaskCompleted` and queues a workflow task on `ORDER_TASK_QUEUE`.
+13. **Order worker polls**…
+14. …and receives the workflow task with the updated history.
+15. **Replay.** The SDK re-runs `processOrder` from the start, using the history.
+16. **Workflow → stub again** at the same line.
+17. **Stub finds the result** in the history and schedules nothing new.
+18. **Stub → workflow.** The call returns `"TXN-…"` and the workflow continues to the inventory step.
 
 **Why there is no in-process shortcut.** A direct method call would not be recorded on the server. Going
 through it every time is what gives retries, timeouts and crash recovery, and it makes **replay** safe:
